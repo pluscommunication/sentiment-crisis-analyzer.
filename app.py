@@ -105,7 +105,7 @@ with st.spinner("Se analizează structura fișierului..."):
 st.success("Fișier încărcat cu succes.")
 
 st.markdown("### 📄 Preview date")
-st.dataframe(df_raw.head(10), use_container_width=True)
+st.dataframe(df_raw.head(10), width="stretch")
 
 cols = df_raw.columns.tolist()
 
@@ -315,7 +315,7 @@ with tab_overview:
             title="Distribuția sentimentului",
             color_discrete_sequence=px.colors.qualitative.Set2,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with colB:
         emo = df_posts["emotion"].value_counts().reset_index()
@@ -329,7 +329,7 @@ with tab_overview:
             title="Distribuția emoțiilor",
             color_discrete_sequence=px.colors.qualitative.Bold,
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
 # -------------------------------------------
 #  TAB TRENDS – Time series
@@ -367,7 +367,7 @@ with tab_trends:
         yaxis_title="(-1) negativ / (+1) pozitiv",
     )
 
-    st.plotly_chart(fig_ts, use_container_width=True)
+    st.plotly_chart(fig_ts, width="stretch")
 
 # -------------------------------------------
 #  TAB CRISIS – analiza crizelor
@@ -377,7 +377,7 @@ with tab_crisis:
     st.markdown("### 🚨 Zile de criză detectate")
     st.dataframe(
         df_daily[df_daily["is_crisis"]],
-        use_container_width=True,
+        width="stretch",
     )
 
     st.markdown("### 📌 Postări din zile critice")
@@ -385,7 +385,7 @@ with tab_crisis:
         df_critical[
             ["Date", text_col, "sentiment", "sentiment_score", "emotion", "emotion_score"]
         ],
-        use_container_width=True,
+        width="stretch",
     )
 
 # -------------------------------------------
@@ -407,7 +407,7 @@ with tab_emotions:
         aspect="auto",
         color_continuous_scale="RdYlBu_r",
     )
-    st.plotly_chart(fig_heat, use_container_width=True)
+    st.plotly_chart(fig_heat, width="stretch")
 
 # -------------------------------------------
 #  TAB EXPORT – Excel downloads
@@ -450,3 +450,4 @@ with tab_data:
 
 # Închidem blocul vizual principal
 st.markdown("</div>", unsafe_allow_html=True)
+
