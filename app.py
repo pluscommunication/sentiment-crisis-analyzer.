@@ -3,11 +3,8 @@ warnings.filterwarnings("ignore")
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-import math
-import io
 
 from datetime import datetime
 
@@ -17,10 +14,8 @@ from utils import (
     smart_read_excel,
     run_pipeline_with_progress,
     compute_daily_features,
-    detect_crisis_scores,
-    detect_change_points,
-    extract_critical_posts,
-    to_excel_bytes
+    detect_crisis_regimes,
+    to_excel_bytes,
 )
 
 # -------------------------------
@@ -41,19 +36,23 @@ with open("style.css") as f:
 #      HERO SECTION (Header)
 # -------------------------------
 
-col_left, col_right = st.columns([3,1])
+col_left, col_right = st.columns([3, 1])
 
 with col_left:
-    st.markdown("""
+    st.markdown(
+        """
         <div class="hero-title">Sentiment & Crisis Analyzer</div>
         <p class="hero-subtitle">
             Dashboard avansat pentru analiza tonului, emoțiilor și identificarea automată
             a momentelor de criză în comunicarea instituțională.
         </p>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
 with col_right:
-    st.markdown("""
+    st.markdown(
+        """
         <div class="kpi-card" style="margin-top:8px;">
             <div class="kpi-label">Status</div>
             <div class="kpi-value" style="font-size:1.1rem;">Transformers active</div>
@@ -61,10 +60,11 @@ with col_right:
                 Modele încărcate automat pe CPU (compatibil Streamlit Cloud)
             </div>
         </div>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
 st.markdown("<br>", unsafe_allow_html=True)
-
 st.markdown('<div class="main-block">', unsafe_allow_html=True)
 
 # -------------------------------
@@ -112,9 +112,17 @@ cols = df_raw.columns.tolist()
 st.markdown("### 🧩 Selectează coloanele relevante")
 col1, col2 = st.columns(2)
 with col1:
-    text_col = st.selectbox("Coloana text", cols, index=cols.index("Message") if "Message" in cols else 0)
+    text_col = st.selectbox(
+        "Coloana text",
+        cols,
+        index=cols.index("Message") if "Message" in cols else 0
+    )
 with col2:
-    date_col = st.selectbox("Coloana dată", cols, index=cols.index("Date") if "Date" in cols else 0)
+    date_col = st.selectbox(
+        "Coloana dată",
+        cols,
+        index=cols.index("Date") if "Date" in cols else 0
+    )
 
 st.markdown("---")
 
@@ -126,15 +134,22 @@ run_button = st.button("🚀 Rulează analiza completă")
 
 if run_button or "results" not in st.session_state:
 
+    # 1. Încărcăm modelele
     with st.spinner("Se încarcă modelele NLP..."):
         sent_pipe, emo_pipe = load_models()
 
+    # 2. Pregătim datele
     df = df_raw.copy()
     df["text"] = df[text_col].astype(str).fillna("")
     df["Date"] = pd.to_datetime(df[date_col], errors="coerce")
 
+    # Filtrare rânduri fără dată sau fără text
+    df = df[df["text"].str.strip().ne("")]
+    df = df.dropna(subset=["Date"])
+
     texts = df["text"].tolist()
 
+    # 3. Rulăm analizele NLP cu progres
     st.markdown("### 🔄 Analiză NLP în desfășurare")
     progress_placeholder = st.empty()
 
@@ -150,41 +165,54 @@ if run_button or "results" not in st.session_state:
 
     st.success("Modelele NLP au rulat cu succes.")
 
-    # Atașare rezultate NLP
-    df["sentiment_raw"] = [o[0]["label"] if isinstance(o, list) else o["label"] for o in sent_outputs]
-    df["sentiment_score"] = [o[0]["score"] if isinstance(o, list) else o["score"] for o in sent_outputs]
-    df["emotion"] = [o[0]["label"] if isinstance(o, list) else o["label"] for o in emo_outputs]
-    df["emotion_score"] = [o[0]["score"] if isinstance(o, list) else o["score"] for o in emo_outputs]
+    # 4. Atașăm rezultatele NLP la DataFrame
+    df["sentiment_raw"] = [
+        o[0]["label"] if isinstance(o, list) and len(o) > 0 else o["label"]
+        for o in sent_outputs
+    ]
+    df["sentiment_score"] = [
+        o[0]["score"] if isinstance(o, list) and len(o) > 0 else o["score"]
+        for o in sent_outputs
+    ]
+    df["emotion"] = [
+        o[0]["label"] if isinstance(o, list) and len(o) > 0 else o["label"]
+        for o in emo_outputs
+    ]
+    df["emotion_score"] = [
+        o[0]["score"] if isinstance(o, list) and len(o) > 0 else o["score"]
+        for o in emo_outputs
+    ]
 
-    # Mapare label-uri
+    # Mapare label-uri pentru sentiment
     map_sent = {
         "LABEL_0": "negative",
         "LABEL_1": "neutral",
         "LABEL_2": "positive",
         "NEGATIVE": "negative",
         "NEUTRAL": "neutral",
-        "POSITIVE": "positive"
+        "POSITIVE": "positive",
     }
     df["sentiment"] = df["sentiment_raw"].replace(map_sent)
 
-    # DAILY FEATURES
+    # 5. DAILY FEATURES (serii zilnice)
     df_daily = compute_daily_features(df)
 
-    # CRISIS SCORE
-    df_daily = detect_crisis_scores(df_daily, threshold=crisis_threshold)
+    # 6. Regimuri și crize (zile de criză + change points)
+    df_daily, cluster_profile, crisis_days, change_days = detect_crisis_regimes(
+        df_daily, crisis_threshold=crisis_threshold
+    )
 
-    # CHANGE POINTS
-    change_days = detect_change_points(df_daily)
+    # 7. Postări critice (din zilele de criză)
+    crisis_dates = crisis_days["Day"].dt.date.tolist()
+    df_critical = df[df["Date"].dt.date.isin(crisis_dates)].copy()
 
-    # POSTĂRI CRITICE
-    df_critical = extract_critical_posts(df, df_daily)
-
-    # Salvăm în sesiune
+    # 8. Salvăm în sesiune
     st.session_state["results"] = {
         "df_posts": df,
         "df_daily": df_daily,
         "df_critical": df_critical,
-        "change_days": change_days
+        "change_days": change_days,
+        "crisis_days": crisis_days,
     }
 
 # -------------------------------
@@ -196,6 +224,7 @@ df_posts = results["df_posts"]
 df_daily = results["df_daily"]
 df_critical = results["df_critical"]
 change_days = results["change_days"]
+crisis_days = results["crisis_days"]
 
 # -------------------------------
 #        KPI SECTION
@@ -206,42 +235,54 @@ st.markdown("## 🔍 Rezumat general")
 total_posts = len(df_posts)
 pos_pct = (df_posts["sentiment"] == "positive").mean() * 100
 neg_pct = (df_posts["sentiment"] == "negative").mean() * 100
-dom_emotion = df_posts["emotion"].value_counts().idxmax()
+dom_emotion = df_posts["emotion"].value_counts().idxmax() if not df_posts["emotion"].isna().all() else "N/A"
 n_crisis_days = df_daily["is_crisis"].sum()
 
 c1, c2, c3, c4 = st.columns(4)
 
 with c1:
-    st.markdown(f"""
-    <div class="kpi-card">
-        <div class="kpi-label">Postări analizate</div>
-        <div class="kpi-value">{total_posts:,}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-label">Postări analizate</div>
+            <div class="kpi-value">{total_posts:,}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 with c2:
-    st.markdown(f"""
-    <div class="kpi-card">
-        <div class="kpi-label">% pozitive</div>
-        <div class="kpi-value">{pos_pct:.1f}%</div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-label">% pozitive</div>
+            <div class="kpi-value">{pos_pct:.1f}%</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 with c3:
-    st.markdown(f"""
-    <div class="kpi-card">
-        <div class="kpi-label">% negative</div>
-        <div class="kpi-value">{neg_pct:.1f}%</div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-label">% negative</div>
+            <div class="kpi-value">{neg_pct:.1f}%</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 with c4:
-    st.markdown(f"""
-    <div class="kpi-card">
-        <div class="kpi-label">Zile de criză</div>
-        <div class="kpi-value">{n_crisis_days}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-label">Zile de criză</div>
+            <div class="kpi-value">{n_crisis_days}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 st.markdown("---")
 
@@ -299,23 +340,31 @@ with tab_trends:
 
     fig_ts = go.Figure()
 
-    fig_ts.add_trace(go.Scatter(
-        x=df_daily["Day"], y=df_daily["sent_mean"],
-        mode="lines", name="Sentiment mediu",
-        line=dict(color="#2563eb", width=2.2)
-    ))
+    fig_ts.add_trace(
+        go.Scatter(
+            x=df_daily["Day"],
+            y=df_daily["sent_mean"],
+            mode="lines",
+            name="Sentiment mediu",
+            line=dict(color="#2563eb", width=2.2),
+        )
+    )
 
     # Marcare crize
     crisis_points = df_daily[df_daily["is_crisis"]]
-    fig_ts.add_trace(go.Scatter(
-        x=crisis_points["Day"], y=crisis_points["sent_mean"],
-        mode="markers", marker=dict(size=10, color="#ef4444"),
-        name="Zile de criză"
-    ))
+    fig_ts.add_trace(
+        go.Scatter(
+            x=crisis_points["Day"],
+            y=crisis_points["sent_mean"],
+            mode="markers",
+            marker=dict(size=10, color="#ef4444"),
+            name="Zile de criză",
+        )
+    )
 
     fig_ts.update_layout(
         title="Sentiment mediu pe zi",
-        yaxis_title="(-1) negativ / (+1) pozitiv"
+        yaxis_title="(-1) negativ / (+1) pozitiv",
     )
 
     st.plotly_chart(fig_ts, use_container_width=True)
@@ -328,13 +377,15 @@ with tab_crisis:
     st.markdown("### 🚨 Zile de criză detectate")
     st.dataframe(
         df_daily[df_daily["is_crisis"]],
-        use_container_width=True
+        use_container_width=True,
     )
 
     st.markdown("### 📌 Postări din zile critice")
     st.dataframe(
-        df_critical[[ "Date", text_col, "sentiment", "sentiment_score", "emotion", "emotion_score" ]],
-        use_container_width=True
+        df_critical[
+            ["Date", text_col, "sentiment", "sentiment_score", "emotion", "emotion_score"]
+        ],
+        use_container_width=True,
     )
 
 # -------------------------------------------
@@ -344,7 +395,9 @@ with tab_crisis:
 with tab_emotions:
     st.markdown("### 🎭 Mapa termică a emoțiilor")
 
-    emo_map = df_daily[["anger_ratio", "joy_ratio", "sadness_ratio", "fear_ratio"]].T
+    emo_map = df_daily[
+        ["anger_ratio", "joy_ratio", "sadness_ratio", "fear_ratio"]
+    ].T
 
     fig_heat = px.imshow(
         emo_map,
@@ -352,7 +405,7 @@ with tab_emotions:
         x=df_daily["Day"],
         y=["Furie", "Bucurie", "Tristețe", "Teamă"],
         aspect="auto",
-        color_continuous_scale="RdYlBu_r"
+        color_continuous_scale="RdYlBu_r",
     )
     st.plotly_chart(fig_heat, use_container_width=True)
 
@@ -372,7 +425,7 @@ with tab_data:
             file_name="postari_sentiment_emo.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="d1",
-            type="primary"
+            type="primary",
         )
 
     with colE2:
@@ -382,7 +435,7 @@ with tab_data:
             file_name="serii_zilnice_criza.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="d2",
-            type="primary"
+            type="primary",
         )
 
     with colE3:
@@ -392,8 +445,8 @@ with tab_data:
             file_name="postari_crize.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="d3",
-            type="primary"
+            type="primary",
         )
 
-# Închidem blocul vizual
+# Închidem blocul vizual principal
 st.markdown("</div>", unsafe_allow_html=True)
