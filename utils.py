@@ -77,10 +77,22 @@ def smart_read_excel(uploaded_file):
 # 3. PIPELINE CU PROGRES (BATCH)
 # ======================================================
 
-def run_pipeline_with_progress(pipe, texts, batch_size, callback=None):
+def run_pipeline_with_progress(
+    pipe,
+    texts,
+    batch_size,
+    label=None,
+    progress_container=None,
+    callback=None,
+):
     """
     Rulează un pipeline Transformers în batch-uri.
-    callback(progress) → procent progres pentru Streamlit.
+
+    Poate fi folosit în două moduri:
+    - din app.py: run_pipeline_with_progress(pipe, texts, batch_size, "Sentiment", placeholder)
+      -> se afișează bară de progres în UI
+    - din cod intern: run_pipeline_with_progress(pipe, texts, batch_size, callback=func)
+      -> se apelează doar callback(progress)
     """
     total = len(texts)
     if total == 0:
@@ -89,16 +101,35 @@ def run_pipeline_with_progress(pipe, texts, batch_size, callback=None):
     num_batches = math.ceil(total / batch_size)
     results = []
 
+    progress_bar = None
+    if progress_container is not None:
+        # progress_container este un st.empty() din app.py
+        progress_bar = progress_container.progress(
+            0.0,
+            text=f"{label}: 0%" if label else "0%"
+        )
+
+    def internal_callback(p):
+        # actualizează bara vizuală dacă există
+        if progress_bar is not None:
+            percent = int(p * 100)
+            progress_bar.progress(
+                p,
+                text=f"{label}: {percent}%" if label else f"{percent}%"
+            )
+        # notifică callback-ul extern, dacă e dat
+        if callback is not None:
+            callback(p)
+
     for i in range(num_batches):
-        batch = texts[i * batch_size:(i + 1) * batch_size]
+        batch = texts[i * batch_size : (i + 1) * batch_size]
         out = pipe(batch)
         results.extend(out)
 
-        if callback:
-            callback((i + 1) / num_batches)
+        progress = (i + 1) / num_batches
+        internal_callback(progress)
 
     return results
-
 
 # ======================================================
 # 4. EXPORT EXCEL → BYTES
