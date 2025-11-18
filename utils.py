@@ -2,41 +2,60 @@ import io
 import math
 from datetime import datetime
 
-import pandas as pd
 import numpy as np
-
-from transformers import pipeline
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.ensemble import IsolationForest
 import ruptures as rpt
+from transformers import (
+    pipeline,
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+)
 
 
-# ======================================================
-# 1. UTILITAR — ÎNCĂRCARE MODELE (CACHE)
-# ======================================================
+# ============================================
+# 1. MODELE TRANSFORMER
+# ============================================
 
 def load_models():
     """
-    Încarcă modelele într-o manieră compatibilă pentru Streamlit Cloud.
-    NU folosește modele mari → compatibil cu spațiu limitat.
+    Încarcă explicit modelele și tokenizer-ele ca să evităm problemele cu 'meta tensors'
+    pe Torch + Transformers în mediul Streamlit Cloud.
     """
-    sentiment_model = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
-    emotion_model = "j-hartmann/emotion-english-distilroberta-base"
+    sentiment_model_id = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
+    emotion_model_id = "j-hartmann/emotion-english-distilroberta-base"
+
+    # --- Sentiment ---
+    sent_tokenizer = AutoTokenizer.from_pretrained(sentiment_model_id)
+    sent_model = AutoModelForSequenceClassification.from_pretrained(
+        sentiment_model_id,
+        low_cpu_mem_usage=False,   # forțăm încărcare completă, fără meta
+    )
 
     sent_pipe = pipeline(
         "sentiment-analysis",
-        model=sentiment_model,
-        tokenizer=sentiment_model,
+        model=sent_model,
+        tokenizer=sent_tokenizer,
+        device=-1,                # CPU
         truncation=True,
         max_length=512,
     )
 
+    # --- Emoții ---
+    emo_tokenizer = AutoTokenizer.from_pretrained(emotion_model_id)
+    emo_model = AutoModelForSequenceClassification.from_pretrained(
+        emotion_model_id,
+        low_cpu_mem_usage=False,
+    )
+
     emo_pipe = pipeline(
         "text-classification",
-        model=emotion_model,
-        tokenizer=emotion_model,
+        model=emo_model,
+        tokenizer=emo_tokenizer,
         top_k=1,
+        device=-1,
         truncation=True,
         max_length=512,
     )
@@ -44,21 +63,21 @@ def load_models():
     return sent_pipe, emo_pipe
 
 
-# ======================================================
-# 2. CITIRE EXCEL — DETECTEAZĂ HEADER „Date/Message”
-# ======================================================
+# ============================================
+# 2. CITIRE INTELIGENTĂ EXCEL
+# ============================================
 
 def smart_read_excel(uploaded_file):
     """
-    Identifică automat header-ul (potrivit pentru fișiere CrowdTangle).
-    Dacă nu detectează „Date” și „Message”, folosește primul rând.
+    Încarcă un Excel Crowdtangle-like și detectează automat header-ul
+    cu 'Date' și 'Message'. Dacă nu găsește, folosește primul rând ca header.
     """
     raw = pd.read_excel(uploaded_file, header=None, engine="openpyxl")
 
     header_row_idx = None
     for i, row in raw.iterrows():
-        values = row.astype(str).tolist()
-        if "Date" in values and "Message" in values:
+        vals = row.astype(str).tolist()
+        if "Date" in vals and "Message" in vals:
             header_row_idx = i
             break
 
@@ -66,16 +85,16 @@ def smart_read_excel(uploaded_file):
         df = pd.read_excel(uploaded_file)
     else:
         header = raw.iloc[header_row_idx].tolist()
-        df = raw.iloc[header_row_idx + 1:].copy()
+        df = raw.iloc[header_row_idx + 1 :].copy()
         df.columns = pd.Index(header).astype(str).str.strip()
         df = df.dropna(axis=1, how="all")
 
     return df
 
 
-# ======================================================
-# 3. PIPELINE CU PROGRES (BATCH)
-# ======================================================
+# ============================================
+# 3. PIPELINE CU PROGRES
+# ============================================
 
 def run_pipeline_with_progress(
     pipe,
@@ -89,10 +108,12 @@ def run_pipeline_with_progress(
     Rulează un pipeline Transformers în batch-uri.
 
     Poate fi folosit în două moduri:
-    - din app.py: run_pipeline_with_progress(pipe, texts, batch_size, "Sentiment", placeholder)
-      -> se afișează bară de progres în UI
-    - din cod intern: run_pipeline_with_progress(pipe, texts, batch_size, callback=func)
-      -> se apelează doar callback(progress)
+    - din app.py:
+        run_pipeline_with_progress(pipe, texts, batch_size, "Sentiment", placeholder)
+      -> actualizează o bară de progres Streamlit
+    - din cod intern:
+        run_pipeline_with_progress(pipe, texts, batch_size, callback=func)
+      -> doar apelări de callback(progress)
     """
     total = len(texts)
     if total == 0:
@@ -103,21 +124,18 @@ def run_pipeline_with_progress(
 
     progress_bar = None
     if progress_container is not None:
-        # progress_container este un st.empty() din app.py
         progress_bar = progress_container.progress(
             0.0,
-            text=f"{label}: 0%" if label else "0%"
+            text=f"{label}: 0%" if label else "0%",
         )
 
     def internal_callback(p):
-        # actualizează bara vizuală dacă există
         if progress_bar is not None:
             percent = int(p * 100)
             progress_bar.progress(
                 p,
-                text=f"{label}: {percent}%" if label else f"{percent}%"
+                text=f"{label}: {percent}%" if label else f"{percent}%",
             )
-        # notifică callback-ul extern, dacă e dat
         if callback is not None:
             callback(p)
 
@@ -131,250 +149,128 @@ def run_pipeline_with_progress(
 
     return results
 
-# ======================================================
-# 4. EXPORT EXCEL → BYTES
-# ======================================================
 
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
-    return output.getvalue()
+# ============================================
+# 4. FEATURES ZILNICE (SERII DE TIMP)
+# ============================================
 
-
-# ======================================================
-# 5. FEATURE ENGINEERING COMPLET (DAILY)
-# ======================================================
-
-def build_daily_series(df_posts):
+def compute_daily_features(df_posts: pd.DataFrame) -> pd.DataFrame:
     """
-    Creează serii zilnice cu:
-    - volum
-    - sentiment mean/std
-    - negative, positive ratio
-    - emoții ratio
+    Primește df_posts (cu coloane Date, sentiment, emotion) și construiește
+    serii de timp la nivel de zi: volum, ton, emoții, scoruri z-normalizate.
     """
-
     df = df_posts.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 
     sent_map = {"negative": -1, "neutral": 0, "positive": 1}
     df["sentiment_num"] = df["sentiment"].map(sent_map)
 
-    def emo_ratio(group, emo):
-        return (group["emotion"] == emo).mean()
+    def emotion_ratio(group, emo):
+        return (group["emotion"] == emo).sum() / len(group) if len(group) > 0 else 0
 
     daily = (
-        df.groupby(df["Date"].dt.date)
-        .apply(lambda g: pd.Series({
-            "n_posts": len(g),
-            "sent_mean": g["sentiment_num"].mean(),
-            "sent_std": g["sentiment_num"].std(ddof=0) if len(g) > 1 else 0,
-            "neg_ratio": (g["sentiment"] == "negative").mean(),
-            "pos_ratio": (g["sentiment"] == "positive").mean(),
-            "anger_ratio": emo_ratio(g, "anger"),
-            "joy_ratio": emo_ratio(g, "joy"),
-            "sadness_ratio": emo_ratio(g, "sadness"),
-            "fear_ratio": emo_ratio(g, "fear"),
-        }))
+        df
+        .groupby(df["Date"].dt.date)
+        .apply(
+            lambda g: pd.Series(
+                {
+                    "n_posts": len(g),
+                    "sent_mean": g["sentiment_num"].mean(),
+                    "sent_std": g["sentiment_num"].std(ddof=0) if len(g) > 1 else 0,
+                    "neg_ratio": (g["sentiment"] == "negative").mean(),
+                    "pos_ratio": (g["sentiment"] == "positive").mean(),
+                    "anger_ratio": emotion_ratio(g, "anger"),
+                    "joy_ratio": emotion_ratio(g, "joy"),
+                    "sadness_ratio": emotion_ratio(g, "sadness"),
+                    "fear_ratio": emotion_ratio(g, "fear"),
+                }
+            )
+        )
         .reset_index()
         .rename(columns={"Date": "Day"})
     )
 
-    daily["Day"] = pd.to_datetime(daily["Day"])
+    daily["Day"] = pd.to_datetime(daily["Day"], errors="coerce")
+    daily = daily.sort_values("Day").reset_index(drop=True)
 
-    return daily.sort_values("Day").reset_index(drop=True)
-
-
-# ======================================================
-# 6. SCOR COMPLEX DE CRIZĂ (Z-SCORES)
-# ======================================================
-
-def compute_crisis_score(daily, threshold=1.2):
-    """
-    Creează trei indicatori normalizați:
-    - negativitate (neg_ratio)
-    - volatilitate ton (sent_std)
-    - volum (n_posts)
-
-    Scorul de criză = media z-score-urilor pozitive.
-    """
-    daily = daily.copy()
-
+    # z-score pentru volum, negativitate, volatilitate
     for col in ["neg_ratio", "sent_std", "n_posts"]:
         m = daily[col].mean()
-        s = daily[col].std(ddof=0)
-        if s == 0:
-            s = 1.0
-        daily[col + "_z"] = (daily[col] - m) / s
+        s = daily[col].std(ddof=0) if daily[col].std(ddof=0) > 0 else 1.0
+        daily[f"{col}_z"] = (daily[col] - m) / s
 
     daily["neg_z_pos"] = daily["neg_ratio_z"].clip(lower=0)
     daily["std_z_pos"] = daily["sent_std_z"].clip(lower=0)
     daily["vol_z_pos"] = daily["n_posts_z"].clip(lower=0)
 
     daily["crisis_score"] = (
-        daily["neg_z_pos"] +
-        daily["std_z_pos"] +
-        daily["vol_z_pos"]
+        daily["neg_z_pos"] + daily["std_z_pos"] + daily["vol_z_pos"]
     ) / 3.0
-
-    daily["is_crisis"] = (daily["crisis_score"] > threshold) & (daily["n_posts"] >= 3)
 
     return daily
 
 
-# ======================================================
-# 7. CLUSTERING (K-MEANS) — 3 REGIMURI DE TONALITATE
-# ======================================================
+# ============================================
+# 5. REGIMURI & CRIZE
+# ============================================
 
-def cluster_daily_regimes(daily):
-    daily = daily.copy()
+def detect_crisis_regimes(daily: pd.DataFrame, crisis_threshold: float = 1.2):
+    """
+    Primește daily features și:
+    - marchează zilele de criză (is_crisis)
+    - face clustering în 3 regimuri
+    - detectează puncte de schimbare de ton
+    - extrage zilele de criză și change points
+    """
+    df_daily = daily.copy()
 
-    features = [
-        "n_posts", "sent_mean", "sent_std", "neg_ratio",
-        "pos_ratio", "anger_ratio", "joy_ratio",
-        "sadness_ratio", "fear_ratio"
+    df_daily["is_crisis"] = (
+        (df_daily["crisis_score"] > crisis_threshold) & (df_daily["n_posts"] >= 3)
+    )
+
+    feature_cols = [
+        "n_posts",
+        "sent_mean",
+        "sent_std",
+        "neg_ratio",
+        "pos_ratio",
+        "anger_ratio",
+        "joy_ratio",
+        "sadness_ratio",
+        "fear_ratio",
     ]
-
-    X = daily[features].fillna(0).values
-
+    X = df_daily[feature_cols].fillna(0).values
     scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
+    X_scaled = scaler.fit_transform(X)
 
-    km = KMeans(n_clusters=3, n_init=10, random_state=42)
-    daily["regime_cluster"] = km.fit_predict(Xs)
+    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
+    df_daily["regime_cluster"] = kmeans.fit_predict(X_scaled)
+    cluster_profile = df_daily.groupby("regime_cluster")[feature_cols].mean()
 
-    profile = daily.groupby("regime_cluster")[features].mean()
+    regime_names = {0: "Regim 0", 1: "Regim 1", 2: "Regim 2"}
+    df_daily["regime_name"] = df_daily["regime_cluster"].map(regime_names)
 
-    name_map = {0: "Regim 0", 1: "Regim 1", 2: "Regim 2"}
-    daily["regime_name"] = daily["regime_cluster"].map(name_map)
-
-    return daily, profile
-
-
-# ======================================================
-# 8. CHANGE POINT DETECTION
-# ======================================================
-
-def detect_change_points(daily):
-    """
-    Utilizează PELT + model RBF pentru detectarea
-    schimbărilor în tonul mediu (sent_mean).
-    """
-    signal = daily["sent_mean"].fillna(0).values
-
+    signal = df_daily["sent_mean"].fillna(0).values
     algo = rpt.Pelt(model="rbf").fit(signal)
     change_indices = algo.predict(pen=5)
 
-    return daily.iloc[[i - 1 for i in change_indices if i - 1 < len(daily)]]["Day"]
+    change_days = df_daily.loc[
+        [i - 1 for i in change_indices if 0 <= i - 1 < len(df_daily)],
+        "Day",
+    ]
+
+    crisis_days = df_daily[df_daily["is_crisis"]].copy()
+
+    return df_daily, cluster_profile, crisis_days, change_days
 
 
-# ======================================================
-# 9. CRITICAL POSTS (ZILE CU CRIZĂ)
-# ======================================================
+# ============================================
+# 6. EXCEL EXPORT
+# ============================================
 
-def extract_critical_posts(df_posts, daily):
-    crisis_dates = daily[daily["is_crisis"]]["Day"].dt.date.tolist()
-    return df_posts[df_posts["Date"].dt.date.isin(crisis_dates)].copy()
-
-
-# ======================================================
-# 10. ROUTĂ PRINCIPALĂ — ANALIZĂ COMPLETĂ
-# ======================================================
-
-def full_advanced_analysis(df_raw, text_col, date_col, batch_size, crisis_threshold, progress_callback=None):
-    """
-    Combină TOATE etapele într-o singură funcție.
-    Returnează structurile necesare UI-ului.
-    """
-
-    # pregătire
-    df = df_raw.copy()
-    df["text"] = df[text_col].astype(str).fillna("")
-    df["Date"] = pd.to_datetime(df[date_col], errors="coerce")
-    df = df.dropna(subset=["Date"])
-    df = df[df["text"].str.strip().ne("")]
-
-    # încarcă modele
-    sent_pipe, emo_pipe = load_models()
-
-    # rulează
-    texts = df["text"].tolist()
-
-    def progress(p):
-        if progress_callback:
-            progress_callback(p)
-
-    sent_out = run_pipeline_with_progress(sent_pipe, texts, batch_size, callback=progress)
-    emo_out = run_pipeline_with_progress(emo_pipe, texts, batch_size, callback=progress)
-
-    # procesare sentiment
-    sent_labels = []
-    sent_scores = []
-    for o in sent_out:
-        o = o[0] if isinstance(o, list) else o
-        sent_labels.append(o.get("label"))
-        sent_scores.append(o.get("score"))
-
-    df["sentiment_raw"] = sent_labels
-    df["sentiment_score"] = sent_scores
-
-    label_map = {
-        "LABEL_0": "negative",
-        "LABEL_1": "neutral",
-        "LABEL_2": "positive",
-        "NEGATIVE": "negative",
-        "NEUTRAL": "neutral",
-        "POSITIVE": "positive",
-    }
-    df["sentiment"] = df["sentiment_raw"].replace(label_map)
-
-    # procesare emoții
-    emo_labels = []
-    emo_scores = []
-    for r in emo_out:
-        r = r[0] if isinstance(r, list) else r
-        emo_labels.append(r.get("label"))
-        emo_scores.append(r.get("score"))
-    df["emotion"] = emo_labels
-    df["emotion_score"] = emo_scores
-
-    # FEATURES ZILNICE
-    daily = build_daily_series(df)
-
-    # scor criză
-    daily = compute_crisis_score(daily, threshold=crisis_threshold)
-
-    # clustering
-    daily, cluster_profile = cluster_daily_regimes(daily)
-
-    # change points
-    change_days = detect_change_points(daily)
-
-    # postări critice
-    df_critical = extract_critical_posts(df, daily)
-
-    # ======================================================
-# 11. ALIASE PENTRU COMPATIBILITATE CU app.py
-# ======================================================
-
-def compute_daily_features(df_posts):
-    """
-    Alias pentru build_daily_series, folosit în app.py.
-    """
-    return build_daily_series(df_posts)
-
-
-def detect_crisis_scores(daily, threshold=1.2):
-    """
-    Alias pentru compute_crisis_score, folosit în app.py.
-    """
-    return compute_crisis_score(daily, threshold=threshold)
-
-    return {
-        "df_posts": df,
-        "df_daily": daily,
-        "df_critical": df_critical,
-        "cluster_profile": cluster_profile,
-        "change_days": change_days,
-        "crisis_days": daily[daily["is_crisis"]],
-    }
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Transformă un DataFrame în bytes pentru download Excel."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    return output.getvalue()
