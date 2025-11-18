@@ -322,6 +322,23 @@ def full_advanced_analysis(df_raw, text_col, date_col, batch_size, crisis_thresh
     # postări critice
     df_critical = extract_critical_posts(df, daily)
 
+    # ======================================================
+# 11. ALIASE PENTRU COMPATIBILITATE CU app.py
+# ======================================================
+
+def compute_daily_features(df_posts):
+    """
+    Alias pentru build_daily_series, folosit în app.py.
+    """
+    return build_daily_series(df_posts)
+
+
+def detect_crisis_scores(daily, threshold=1.2):
+    """
+    Alias pentru compute_crisis_score, folosit în app.py.
+    """
+    return compute_crisis_score(daily, threshold=threshold)
+
     return {
         "df_posts": df,
         "df_daily": daily,
