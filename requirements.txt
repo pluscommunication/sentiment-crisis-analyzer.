@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+transformers
+torch
+scikit-learn
+ruptures
+plotly
+openpyxl
